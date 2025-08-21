@@ -1,0 +1,85 @@
+<div id="manual-analysis" style="display: none;">
+   <h1>How to Use the Spotify Analysis Downloader</h1>
+   <p>
+        The Spotify Analysis Downloader lets you download analysis data for the track currently playing on Spotify and any track changes until you close or reload the tab. It only works on desktop browsers. If you want to listen to the song on mobile, upload the analysis from a desktop browser first. Follow these steps to use it:
+   <ol>
+       <li>
+            <strong>Show your bookmarks bar:</strong>
+           <ul>
+               <li><strong>Chrome:</strong> Press <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>B</kbd> (Windows) or <kbd>Cmd</kbd> + <kbd>Shift</kbd> + <kbd>B</kbd> (Mac) to toggle the bookmark bar.
+               <li><strong>Firefox:</strong> Click the menu button and select <strong>Library</strong>, then <strong>Bookmarks</strong>, and <strong>Bookmarking Tools</strong>, and select <strong>Show Bookmarks Toolbar</strong>.
+               <li><strong>Edge:</strong> Press <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>B</kbd> or go to <strong>Settings</strong> &gt; <strong>Appearance</strong> &gt; <strong>Show favorites bar</strong> and set to <strong>Always</strong>.
+               <li><strong>Safari:</strong> Go to <strong>View</strong> in the top menu and select <strong>Show Favorites Bar</strong>.
+           </ul>
+       <li>
+            <strong>Bookmark the following link:</strong>
+            Drag this button to your bookmark bar to save it as a bookmark:
+            <a href="javascript:(() => { function downloadAudioAnalysis(trackId, playerSDK) {
+    const bearerToken = playerSDK._client?._transport?._lastToken;
+    bearerToken && fetch(`https://api.spotify.com/v1/audio-analysis/${trackId}`, {
+        headers: { 'Authorization': `Bearer ${bearerToken}`, 'Content-Type': 'application/json' }
+    }).then(r => r.ok && r.json().then(data => {
+        const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `${trackId}.json`;
+        link.click();
+        URL.revokeObjectURL(url);
+    }));
+}
+function checkForSongChanges(playerSDK) {
+    let currentTrackId = null;
+    const updateTrack = (playerState) => {
+        const currentTrack = playerState?.track_window?.current_track;
+        if (currentTrack && currentTrack.content_type === 'music' && currentTrack.id !== currentTrackId) {
+            currentTrackId = currentTrack.id;
+            downloadAudioAnalysis(currentTrackId, playerSDK);
+        }
+    };
+    updateTrack(playerSDK._controller?._state);
+    playerSDK._listeners['state_changed'].push({ listener: (e) => updateTrack(e.data?.state), options: {} });
+}
+const waitForPlayerSDKInterval = setInterval(() => {
+    const nowPlayingBar = document.querySelector('[data-testid=\'now-playing-bar\']');
+    if (nowPlayingBar) {
+        let fiberNode = null;
+        for (const key in nowPlayingBar) {
+            if (key.startsWith('__reactFiber$')) {
+                fiberNode = nowPlayingBar[key];
+                break;
+            }
+        }
+        while (fiberNode && !fiberNode.memoizedProps?.value?._map) fiberNode = fiberNode?.return;
+        if (fiberNode) for (const [k, v] of fiberNode.memoizedProps.value._map) {
+            if (k.toString() === 'Symbol(PlayerSDK)') {
+                const playerSDK = v?.instance?.harmony;
+                if (playerSDK) {
+                    clearInterval(waitForPlayerSDKInterval);
+                    checkForSongChanges(playerSDK);
+                    break;
+                }
+            }
+        }
+    }
+});
+ })();" class="btn btn-small btn-default">Spotify Analysis Downloader</a>
+       <li>
+            <strong>Open Spotify:</strong>
+            Use this link to open Spotify in your browser and log in (Premium account not required):
+            <a href="https://open.spotify.com" target="_blank" class="btn btn-small btn-default">Open Spotify</a> <a id="current-song-link" target="_blank" class="btn btn-small btn-default" style="display: none;">Open current song in Spotify</a>
+       <li>
+            <strong>Play a Spotify track:</strong>
+            Start any track on Spotify to begin downloading analysis data for it. Pausing or muting the track will not impact the downloader.
+       <li>
+            <strong>Use the bookmarklet:</strong>
+            While the song is playing, click the "Spotify Analysis Downloader" bookmarklet from your bookmark bar. This action will download the analysis file for the current track.
+       <li>
+            <strong>Continue listening:</strong>
+            The downloader will automatically save analysis data for each new track you play until you close or reload the tab.
+       <li>
+            <strong>Locate your downloads:</strong>
+            The downloaded files will be in your downloads folder and named after the track IDs (e.g., `03UrZgTINDqvnUMbbIMhql.json`).
+       <li>
+            <strong>Upload the analysis file:</strong>
+            Match the filename with the track ID of the song you tried to play (see the URL) and use the form below to upload the analysis file for processing.
+   </ol>
