@@ -1,1 +1,102 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spotify Mix – Replica</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="app-header">
+    <h1>Mix-Übergänge wie bei Spotify</h1>
+    <p>Lade zwei Songs und deren Analyse-JSON hoch. Plane automatische, beat-ausgerichtete Übergänge mit Equal-Power‑Crossfade, optionalem EQ und exportiere das Ergebnis.</p>
+  </header>
+
+  <main class="app-main">
+    <section class="inputs">
+      <div class="track-card">
+        <h2>Track A</h2>
+        <label class="file-label">Audio-Datei
+          <input id="audioA" type="file" accept="audio/*" />
+        </label>
+        <label class="file-label">Analyse-JSON
+          <input id="jsonA" type="file" accept="application/json,.json" />
+        </label>
+        <div class="meta" id="metaA"></div>
+        <canvas id="waveA" class="wave"></canvas>
+      </div>
+
+      <div class="track-card">
+        <h2>Track B</h2>
+        <label class="file-label">Audio-Datei
+          <input id="audioB" type="file" accept="audio/*" />
+        </label>
+        <label class="file-label">Analyse-JSON
+          <input id="jsonB" type="file" accept="application/json,.json" />
+        </label>
+        <div class="meta" id="metaB"></div>
+        <canvas id="waveB" class="wave"></canvas>
+      </div>
+    </section>
+
+    <section class="planner">
+      <h2>Übergang planen</h2>
+      <div class="controls-grid">
+        <label>Preset-Kurve
+          <select id="curvePreset">
+            <option value="equal-power" selected>Equal-Power</option>
+            <option value="linear">Linear</option>
+            <option value="rise">Rise (sanfter Start, schnelleres Ausblenden)</option>
+          </select>
+        </label>
+
+        <label>Übergangslänge (Beats)
+          <input id="beatsLength" type="number" min="4" max="64" step="1" value="16" />
+        </label>
+
+        <label>Tempo-Anpassung
+          <select id="tempoStrategy">
+            <option value="matchBtoA" selected>B an A anpassen</option>
+            <option value="matchAtoB">A an B anpassen</option>
+            <option value="average">Beide auf Mittelwert</option>
+          </select>
+        </label>
+
+        <div class="eq-row">
+          <label><input id="eqEnable" type="checkbox" checked /> Sanfte EQ-Hilfe im Übergang</label>
+          <div class="eq-params">
+            <label>Tiefen A ducken (dB)
+              <input id="eqLowDuckDb" type="number" step="1" value="-3" />
+            </label>
+            <label>Höhen B boosten (dB)
+              <input id="eqHighBoostDb" type="number" step="1" value="2" />
+            </label>
+          </div>
+        </div>
+
+        <button id="autoPlan" class="primary">Auto-Übergang finden</button>
+      </div>
+
+      <div id="planInfo" class="plan-info"></div>
+    </section>
+
+    <section class="transport">
+      <h2>Vorschau & Export</h2>
+      <div class="transport-row">
+        <button id="previewPlay" class="primary" disabled>Vorschau abspielen</button>
+        <button id="previewStop" disabled>Stopp</button>
+        <button id="renderExport" disabled>Rendern & Download (WAV)</button>
+        <span id="status"></span>
+      </div>
+    </section>
+  </main>
+
+  <footer class="app-footer">
+    <small>Hinweis: Dies ist eine Nachbildung zu Demonstrationszwecken und nutzt lokale Dateien statt der Spotify API. Beispiel-Analyse: <code>mockingbird.json</code>.</small>
+  </footer>
+
+  <script src="script.js"></script>
+  </body>
+</html>
+
 
