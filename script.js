@@ -138,6 +138,58 @@ function computeSmartBeatsLength(analysisA, analysisB, minBeats, maxBeats) {
 }
 
 /**
+ * Simple granular time-stretch scheduler (pitch-preserving)
+ * Schedules overlapping grains with short fade in/out envelopes.
+ * stretch = originalTempo / targetTempo. Example: 120->126 BPM => stretch ~ 0.952.
+ */
+function scheduleGranularSegment(ctx, buffer, startWhen, startOffsetSec, endWhen, stretch) {
+  const output = ctx.createGain();
+  output.gain.value = 1;
+  const sampleRate = buffer.sampleRate;
+
+  // Parameters tuned for musical content
+  const grainSec = 0.08; // 80 ms
+  const overlap = 0.5; // 50% overlap
+  const hopOut = grainSec * (1 - (1 - overlap)); // equals grainSec * overlap
+  // With 50% overlap, hopOut = grainSec * 0.5
+  const effectiveHopOut = grainSec * overlap;
+  const hopIn = effectiveHopOut / clamp(stretch || 1, 0.25, 4); // input step
+
+  const windowInSec = Math.min(0.02, grainSec * 0.25);
+  const windowOutSec = Math.min(0.02, grainSec * 0.25);
+
+  let n = 0;
+  while (true) {
+    const grainStartWhen = startWhen + n * effectiveHopOut;
+    if (grainStartWhen >= endWhen) break;
+    const inputOffsetSec = startOffsetSec + n * hopIn;
+    if (inputOffsetSec >= buffer.duration) break;
+
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    src.playbackRate.value = 1.0; // preserve pitch inside grain
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0, grainStartWhen);
+    g.gain.linearRampToValueAtTime(0.9, grainStartWhen + windowInSec);
+    // hold near 0.9 to avoid sum > 1 with overlaps
+    const grainEndWhen = Math.min(grainStartWhen + grainSec, endWhen);
+    const rampOutStart = Math.max(grainStartWhen + grainSec - windowOutSec, grainStartWhen + windowInSec);
+    g.gain.setValueAtTime(0.9, rampOutStart);
+    g.gain.linearRampToValueAtTime(0, Math.min(grainEndWhen, rampOutStart + windowOutSec));
+
+    src.connect(g).connect(output);
+
+    const maxDur = Math.max(0, Math.min(grainSec, buffer.duration - inputOffsetSec));
+    src.start(grainStartWhen, inputOffsetSec, maxDur);
+
+    n++;
+  }
+
+  return output;
+}
+
+/**
  * Draw simple waveform previews (using decoded PCM, downsampled)
  */
 function drawWaveform(canvas, audioBuffer) {
@@ -273,96 +325,113 @@ class MixerEngine {
     if (!ctx) throw new Error('AudioContext fehlt');
 
     const { bufferA, bufferB } = buffers;
-    const { curve, eqEnable, eqLowDuckDb, eqHighBoostDb, tempoRamp, filterSwap } = options;
+    const { curve, eqEnable, eqLowDuckDb, eqHighBoostDb, tempoRamp, filterSwap, pitchLock } = options;
 
     const g = ctx.createGain();
     g.connect(ctx.destination);
 
-    // Sources with playbackRate for tempo matching (naive time-stretch via resample)
-    const srcA = ctx.createBufferSource();
-    srcA.buffer = bufferA;
+    // Choose source path (granular pitch-lock vs. direct buffer source)
+    const now = ctx.currentTime + 0.1;
+    const startAInBuffer = plan.startA;
+    const startBInBuffer = plan.startB;
+    const xfade = plan.xfadeDuration;
+    const t0 = now; // A starts
+    const tX = t0 + xfade; // end of crossfade
 
-    const srcB = ctx.createBufferSource();
-    srcB.buffer = bufferB;
+    const detuneRatioA = ratioFromSemitones(plan.pitchSemisA || 0);
+    const detuneRatioB = ratioFromSemitones(plan.pitchSemisB || 0);
+    const rawTargetRateA = ((plan.targetTempoA || 120) / (buffers.metaA.tempo || 120)) * detuneRatioA;
+    const rawTargetRateB = ((plan.targetTempoB || 120) / (buffers.metaB.tempo || 120)) * detuneRatioB;
+
+    let nodeA, nodeB, srcA, srcB;
+
+    if (pitchLock) {
+      // Use granular stretch with constant factor (disable ramp)
+      const stretchA = 1 / clamp(rawTargetRateA, 0.25, 4); // time-scale = 1 / rate
+      const stretchB = 1 / clamp(rawTargetRateB, 0.25, 4);
+      nodeA = scheduleGranularSegment(ctx, bufferA, t0, startAInBuffer, tX, stretchA);
+      nodeB = scheduleGranularSegment(ctx, bufferB, t0, startBInBuffer, tX, stretchB);
+    } else {
+      // Sources with playbackRate for tempo matching (naive time-stretch via resample)
+      srcA = ctx.createBufferSource();
+      srcA.buffer = bufferA;
+      srcB = ctx.createBufferSource();
+      srcB.buffer = bufferB;
+      nodeA = srcA;
+      nodeB = srcB;
+    }
 
     // Per-track gains
     const gainA = ctx.createGain();
     const gainB = ctx.createGain();
 
     // Optional EQ and filter swap
-    let nodeA = srcA;
-    let nodeB = srcB;
+    let chainA = nodeA;
+    let chainB = nodeB;
     let lowShelfA, lowShelfB, highShelfB, hpA, lpB;
     if (eqEnable) {
       lowShelfA = ctx.createBiquadFilter();
       lowShelfA.type = 'lowshelf';
       lowShelfA.frequency.value = 150;
       lowShelfA.gain.value = 0; // automated later
-      nodeA.connect(lowShelfA);
-      nodeA = lowShelfA;
+      chainA.connect(lowShelfA);
+      chainA = lowShelfA;
 
       // Start B with attenuated bass that opens later
       lowShelfB = ctx.createBiquadFilter();
       lowShelfB.type = 'lowshelf';
       lowShelfB.frequency.value = 150;
       lowShelfB.gain.value = 0;
-      nodeB.connect(lowShelfB);
-      nodeB = lowShelfB;
+      chainB.connect(lowShelfB);
+      chainB = lowShelfB;
 
       highShelfB = ctx.createBiquadFilter();
       highShelfB.type = 'highshelf';
       highShelfB.frequency.value = 6000;
       highShelfB.gain.value = 0; // automated later
-      nodeB.connect(highShelfB);
-      nodeB = highShelfB;
+      chainB.connect(highShelfB);
+      chainB = highShelfB;
     }
     if (filterSwap) {
       hpA = ctx.createBiquadFilter();
       hpA.type = 'highpass';
       hpA.frequency.value = 30;
-      nodeA.connect(hpA);
-      nodeA = hpA;
+      chainA.connect(hpA);
+      chainA = hpA;
 
       lpB = ctx.createBiquadFilter();
       lpB.type = 'lowpass';
       lpB.frequency.value = 4000;
-      nodeB.connect(lpB);
-      nodeB = lpB;
+      chainB.connect(lpB);
+      chainB = lpB;
     }
 
-    nodeA.connect(gainA).connect(g);
-    nodeB.connect(gainB).connect(g);
+    chainA.connect(gainA).connect(g);
+    chainB.connect(gainB).connect(g);
 
-    const now = ctx.currentTime + 0.1;
-    const startAInBuffer = plan.startA;
-    const startBInBuffer = plan.startB;
-    const xfade = plan.xfadeDuration;
-
-    const t0 = now; // A starts
-    const tX = t0 + xfade; // end of crossfade
-
-    // Tempo and pitch handling
-    const detuneRatioA = ratioFromSemitones(plan.pitchSemisA || 0);
-    const detuneRatioB = ratioFromSemitones(plan.pitchSemisB || 0);
-    const baseRateA = 1 * detuneRatioA;
-    const baseRateB = 1 * detuneRatioB;
-    const rawTargetRateA = ((plan.targetTempoA || 120) / (buffers.metaA.tempo || 120)) * detuneRatioA;
-    const rawTargetRateB = ((plan.targetTempoB || 120) / (buffers.metaB.tempo || 120)) * detuneRatioB;
-    const targetRateA = clampPlaybackRate(rawTargetRateA);
-    const targetRateB = clampPlaybackRate(rawTargetRateB);
-
-    if (tempoRamp) {
-      srcA.playbackRate.setValueAtTime(baseRateA, t0);
-      srcA.playbackRate.linearRampToValueAtTime(targetRateA, tX);
-      srcB.playbackRate.setValueAtTime(baseRateB, t0);
-      srcB.playbackRate.linearRampToValueAtTime(targetRateB, tX);
-    } else {
-      srcA.playbackRate.value = targetRateA;
-      srcB.playbackRate.value = targetRateB;
+    // Tempo handling when not pitch-locked
+    if (!pitchLock && srcA && srcB) {
+      const detuneRatioA2 = detuneRatioA;
+      const detuneRatioB2 = detuneRatioB;
+      const baseRateA = 1 * detuneRatioA2;
+      const baseRateB = 1 * detuneRatioB2;
+      const targetRateA = clampPlaybackRate(rawTargetRateA);
+      const targetRateB = clampPlaybackRate(rawTargetRateB);
+      if (tempoRamp) {
+        srcA.playbackRate.setValueAtTime(baseRateA, t0);
+        srcA.playbackRate.linearRampToValueAtTime(targetRateA, tX);
+        srcB.playbackRate.setValueAtTime(baseRateB, t0);
+        srcB.playbackRate.linearRampToValueAtTime(targetRateB, tX);
+      } else {
+        srcA.playbackRate.value = targetRateA;
+        srcB.playbackRate.value = targetRateB;
+      }
     }
 
-    srcA.start(t0, startAInBuffer);
-    srcB.start(t0, startBInBuffer);
+    if (!pitchLock && srcA && srcB) {
+      srcA.start(t0, startAInBuffer);
+      srcB.start(t0, startBInBuffer);
+    }
 
     // Automate gains according to curve
     gainA.gain.setValueAtTime(1, t0);
@@ -380,13 +449,11 @@ class MixerEngine {
         lowShelfA.gain.linearRampToValueAtTime((eqLowDuckDb || 0) * dA, t);
         highShelfB.gain.linearRampToValueAtTime((eqHighBoostDb || 0) * dB, t);
         if (lowShelfB) {
-          // Start with some bass duck on B, release towards end
           const duckB = (Math.min(0, eqLowDuckDb || 0)) * (1 - dB);
           lowShelfB.gain.linearRampToValueAtTime(duckB, t);
         }
       }
       if (filterSwap) {
-        // Thin out lows in A; open highs in B with gentle easing
         const dA = easeOutCubic(tt);
         const dB = easeInCubic(tt);
         const hpCut = 30 + dA * (220 - 30);
@@ -409,84 +476,95 @@ class MixerEngine {
     const oac = new OfflineAudioContext({ numberOfChannels: 2, length: Math.ceil(renderDuration * sampleRate), sampleRate });
 
     const { bufferA, bufferB } = buffers;
-    const { curve, eqEnable, eqLowDuckDb, eqHighBoostDb, tempoRamp, filterSwap } = options;
+    const { curve, eqEnable, eqLowDuckDb, eqHighBoostDb, tempoRamp, filterSwap, pitchLock } = options;
 
-    const srcA = oac.createBufferSource();
-    srcA.buffer = bufferA;
+    // Choose source path
+    const t0 = 0.05;
+    const xfade = plan.xfadeDuration;
+    const tX = t0 + xfade;
 
-    const srcB = oac.createBufferSource();
-    srcB.buffer = bufferB;
+    const detuneRatioA = ratioFromSemitones(plan.pitchSemisA || 0);
+    const detuneRatioB = ratioFromSemitones(plan.pitchSemisB || 0);
+    const rawTargetRateA = ((plan.targetTempoA || 120) / (buffers.metaA.tempo || 120)) * detuneRatioA;
+    const rawTargetRateB = ((plan.targetTempoB || 120) / (buffers.metaB.tempo || 120)) * detuneRatioB;
+
+    let nodeA, nodeB, srcA, srcB;
+    if (pitchLock) {
+      const stretchA = 1 / clamp(rawTargetRateA, 0.25, 4);
+      const stretchB = 1 / clamp(rawTargetRateB, 0.25, 4);
+      nodeA = scheduleGranularSegment(oac, bufferA, t0, plan.startA, tX, stretchA);
+      nodeB = scheduleGranularSegment(oac, bufferB, t0, plan.startB, tX, stretchB);
+    } else {
+      srcA = oac.createBufferSource();
+      srcA.buffer = bufferA;
+      srcB = oac.createBufferSource();
+      srcB.buffer = bufferB;
+      nodeA = srcA;
+      nodeB = srcB;
+    }
 
     const gainA = oac.createGain();
     const gainB = oac.createGain();
 
-    let nodeA = srcA;
-    let nodeB = srcB;
+    let chainA = nodeA;
+    let chainB = nodeB;
     let lowShelfA, lowShelfB, highShelfB, hpA, lpB;
     if (eqEnable) {
       lowShelfA = oac.createBiquadFilter();
       lowShelfA.type = 'lowshelf';
       lowShelfA.frequency.value = 150;
       lowShelfA.gain.value = 0;
-      nodeA.connect(lowShelfA);
-      nodeA = lowShelfA;
+      chainA.connect(lowShelfA);
+      chainA = lowShelfA;
 
       lowShelfB = oac.createBiquadFilter();
       lowShelfB.type = 'lowshelf';
       lowShelfB.frequency.value = 150;
       lowShelfB.gain.value = 0;
-      nodeB.connect(lowShelfB);
-      nodeB = lowShelfB;
+      chainB.connect(lowShelfB);
+      chainB = lowShelfB;
 
       highShelfB = oac.createBiquadFilter();
       highShelfB.type = 'highshelf';
       highShelfB.frequency.value = 6000;
       highShelfB.gain.value = 0;
-      nodeB.connect(highShelfB);
-      nodeB = highShelfB;
+      chainB.connect(highShelfB);
+      chainB = highShelfB;
     }
     if (filterSwap) {
       hpA = oac.createBiquadFilter();
       hpA.type = 'highpass';
       hpA.frequency.value = 30;
-      nodeA.connect(hpA);
-      nodeA = hpA;
+      chainA.connect(hpA);
+      chainA = hpA;
 
       lpB = oac.createBiquadFilter();
       lpB.type = 'lowpass';
       lpB.frequency.value = 4000;
-      nodeB.connect(lpB);
-      nodeB = lpB;
+      chainB.connect(lpB);
+      chainB = lpB;
     }
 
-    nodeA.connect(gainA).connect(oac.destination);
-    nodeB.connect(gainB).connect(oac.destination);
+    chainA.connect(gainA).connect(oac.destination);
+    chainB.connect(gainB).connect(oac.destination);
 
-    const t0 = 0.05;
-    const xfade = plan.xfadeDuration;
-
-    // Tempo and pitch
-    const detuneRatioA = ratioFromSemitones(plan.pitchSemisA || 0);
-    const detuneRatioB = ratioFromSemitones(plan.pitchSemisB || 0);
-    const baseRateA = 1 * detuneRatioA;
-    const baseRateB = 1 * detuneRatioB;
-    const rawTargetRateA = ((plan.targetTempoA || 120) / (buffers.metaA.tempo || 120)) * detuneRatioA;
-    const rawTargetRateB = ((plan.targetTempoB || 120) / (buffers.metaB.tempo || 120)) * detuneRatioB;
-    const targetRateA = clampPlaybackRate(rawTargetRateA);
-    const targetRateB = clampPlaybackRate(rawTargetRateB);
-
-    if (tempoRamp) {
-      srcA.playbackRate.setValueAtTime(baseRateA, t0);
-      srcA.playbackRate.linearRampToValueAtTime(targetRateA, t0 + xfade);
-      srcB.playbackRate.setValueAtTime(baseRateB, t0);
-      srcB.playbackRate.linearRampToValueAtTime(targetRateB, t0 + xfade);
-    } else {
-      srcA.playbackRate.value = targetRateA;
-      srcB.playbackRate.value = targetRateB;
+    if (!pitchLock && srcA && srcB) {
+      const baseRateA = 1 * detuneRatioA;
+      const baseRateB = 1 * detuneRatioB;
+      const targetRateA = clampPlaybackRate(rawTargetRateA);
+      const targetRateB = clampPlaybackRate(rawTargetRateB);
+      if (tempoRamp) {
+        srcA.playbackRate.setValueAtTime(baseRateA, t0);
+        srcA.playbackRate.linearRampToValueAtTime(targetRateA, t0 + xfade);
+        srcB.playbackRate.setValueAtTime(baseRateB, t0);
+        srcB.playbackRate.linearRampToValueAtTime(targetRateB, t0 + xfade);
+      } else {
+        srcA.playbackRate.value = targetRateA;
+        srcB.playbackRate.value = targetRateB;
+      }
+      srcA.start(t0, plan.startA);
+      srcB.start(t0, plan.startB);
     }
-
-    srcA.start(t0, plan.startA);
-    srcB.start(t0, plan.startB);
 
     gainA.gain.setValueAtTime(1, t0);
     gainB.gain.setValueAtTime(0, t0);
@@ -556,6 +634,7 @@ const els = {
   previewStop: document.getElementById('previewStop'),
   renderExport: document.getElementById('renderExport'),
   status: document.getElementById('status'),
+  pitchLock: document.getElementById('pitchLock'),
 };
 
 const state = {
@@ -673,6 +752,7 @@ function getSmartOptions() {
     harmonicMatch: !!els.harmonicMatch?.checked,
     tempoRamp: !!els.tempoRamp?.checked,
     filterSwap: !!els.filterSwap?.checked,
+    pitchLock: !!els.pitchLock?.checked,
     maxDetuneSemis: Number(els.maxDetuneSemis?.value) || 0,
     minBeats: Number(els.minBeats?.value) || undefined,
     maxBeats: Number(els.maxBeats?.value) || undefined,
@@ -710,8 +790,9 @@ els.previewPlay.addEventListener('click', async () => {
       eqEnable: els.eqEnable.checked,
       eqLowDuckDb: Number(els.eqLowDuckDb.value) || 0,
       eqHighBoostDb: Number(els.eqHighBoostDb.value) || 0,
-      tempoRamp: !!state.currentPlan.smart?.tempoRamp,
+      tempoRamp: !!state.currentPlan.smart?.tempoRamp && !state.currentPlan.smart?.pitchLock,
       filterSwap: !!state.currentPlan.smart?.filterSwap,
+      pitchLock: !!state.currentPlan.smart?.pitchLock,
     }
   );
   state.previewNodes = nodes;
@@ -743,8 +824,9 @@ els.renderExport.addEventListener('click', async () => {
       eqEnable: els.eqEnable.checked,
       eqLowDuckDb: Number(els.eqLowDuckDb.value) || 0,
       eqHighBoostDb: Number(els.eqHighBoostDb.value) || 0,
-      tempoRamp: !!state.currentPlan.smart?.tempoRamp,
+      tempoRamp: !!state.currentPlan.smart?.tempoRamp && !state.currentPlan.smart?.pitchLock,
       filterSwap: !!state.currentPlan.smart?.filterSwap,
+      pitchLock: !!state.currentPlan.smart?.pitchLock,
     }
   );
   // Export WAV
