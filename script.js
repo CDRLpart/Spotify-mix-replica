@@ -63,10 +63,33 @@ function createRiseGains(t) {
   return { gA, gB };
 }
 
+function remapSCurve(t) {
+  return 0.5 - 0.5 * Math.cos(Math.PI * clamp(t, 0, 1));
+}
+
+function createDjSGains(t) {
+  // DJ-style: remap time with a gentle S to keep ends longer and reduce mid overlap
+  const s = remapSCurve(t);
+  const gA = Math.cos(s * Math.PI * 0.5);
+  const gB = Math.sin(s * Math.PI * 0.5);
+  return { gA, gB };
+}
+
+// Easing helpers for parameter automation
+function easeInCubic(t) { return t * t * t; }
+function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
+
+// Limit naive resampling to avoid noticeable pitch/tempo artifacts
+function clampPlaybackRate(rate) {
+  const MAX_DEV = 0.06; // ±6%
+  return clamp(rate, 1 - MAX_DEV, 1 + MAX_DEV);
+}
+
 function chooseCurve(name) {
   switch (name) {
     case 'linear': return createLinearGains;
     case 'rise': return createRiseGains;
+    case 'dj-s': return createDjSGains;
     case 'equal-power':
     default: return createEqualPowerGains;
   }
@@ -269,7 +292,7 @@ class MixerEngine {
     // Optional EQ and filter swap
     let nodeA = srcA;
     let nodeB = srcB;
-    let lowShelfA, highShelfB, hpA, lpB;
+    let lowShelfA, lowShelfB, highShelfB, hpA, lpB;
     if (eqEnable) {
       lowShelfA = ctx.createBiquadFilter();
       lowShelfA.type = 'lowshelf';
@@ -277,6 +300,14 @@ class MixerEngine {
       lowShelfA.gain.value = 0; // automated later
       nodeA.connect(lowShelfA);
       nodeA = lowShelfA;
+
+      // Start B with attenuated bass that opens later
+      lowShelfB = ctx.createBiquadFilter();
+      lowShelfB.type = 'lowshelf';
+      lowShelfB.frequency.value = 150;
+      lowShelfB.gain.value = 0;
+      nodeB.connect(lowShelfB);
+      nodeB = lowShelfB;
 
       highShelfB = ctx.createBiquadFilter();
       highShelfB.type = 'highshelf';
@@ -315,8 +346,10 @@ class MixerEngine {
     const detuneRatioB = ratioFromSemitones(plan.pitchSemisB || 0);
     const baseRateA = 1 * detuneRatioA;
     const baseRateB = 1 * detuneRatioB;
-    const targetRateA = ((plan.targetTempoA || 120) / (buffers.metaA.tempo || 120)) * detuneRatioA;
-    const targetRateB = ((plan.targetTempoB || 120) / (buffers.metaB.tempo || 120)) * detuneRatioB;
+    const rawTargetRateA = ((plan.targetTempoA || 120) / (buffers.metaA.tempo || 120)) * detuneRatioA;
+    const rawTargetRateB = ((plan.targetTempoB || 120) / (buffers.metaB.tempo || 120)) * detuneRatioB;
+    const targetRateA = clampPlaybackRate(rawTargetRateA);
+    const targetRateB = clampPlaybackRate(rawTargetRateB);
 
     if (tempoRamp) {
       srcA.playbackRate.setValueAtTime(baseRateA, t0);
@@ -334,7 +367,7 @@ class MixerEngine {
     // Automate gains according to curve
     gainA.gain.setValueAtTime(1, t0);
     gainB.gain.setValueAtTime(0, t0);
-    const steps = 64;
+    const steps = 96;
     for (let i = 0; i <= steps; i++) {
       const tt = i / steps;
       const { gA, gB } = curve(tt);
@@ -342,13 +375,22 @@ class MixerEngine {
       gainA.gain.linearRampToValueAtTime(clamp(gA, 0, 1), t);
       gainB.gain.linearRampToValueAtTime(clamp(gB, 0, 1), t);
       if (eqEnable) {
-        lowShelfA.gain.linearRampToValueAtTime(eqLowDuckDb * tt, t);
-        highShelfB.gain.linearRampToValueAtTime(eqHighBoostDb * tt, t);
+        const dA = easeOutCubic(tt);
+        const dB = easeInCubic(tt);
+        lowShelfA.gain.linearRampToValueAtTime((eqLowDuckDb || 0) * dA, t);
+        highShelfB.gain.linearRampToValueAtTime((eqHighBoostDb || 0) * dB, t);
+        if (lowShelfB) {
+          // Start with some bass duck on B, release towards end
+          const duckB = (Math.min(0, eqLowDuckDb || 0)) * (1 - dB);
+          lowShelfB.gain.linearRampToValueAtTime(duckB, t);
+        }
       }
       if (filterSwap) {
-        // Thin out lows in A; open highs in B
-        const hpCut = 30 + tt * (220 - 30);
-        const lpCut = 4000 + tt * (20000 - 4000);
+        // Thin out lows in A; open highs in B with gentle easing
+        const dA = easeOutCubic(tt);
+        const dB = easeInCubic(tt);
+        const hpCut = 30 + dA * (220 - 30);
+        const lpCut = 4000 + dB * (20000 - 4000);
         hpA.frequency.linearRampToValueAtTime(hpCut, t);
         lpB.frequency.linearRampToValueAtTime(lpCut, t);
       }
@@ -380,7 +422,7 @@ class MixerEngine {
 
     let nodeA = srcA;
     let nodeB = srcB;
-    let lowShelfA, highShelfB, hpA, lpB;
+    let lowShelfA, lowShelfB, highShelfB, hpA, lpB;
     if (eqEnable) {
       lowShelfA = oac.createBiquadFilter();
       lowShelfA.type = 'lowshelf';
@@ -388,6 +430,13 @@ class MixerEngine {
       lowShelfA.gain.value = 0;
       nodeA.connect(lowShelfA);
       nodeA = lowShelfA;
+
+      lowShelfB = oac.createBiquadFilter();
+      lowShelfB.type = 'lowshelf';
+      lowShelfB.frequency.value = 150;
+      lowShelfB.gain.value = 0;
+      nodeB.connect(lowShelfB);
+      nodeB = lowShelfB;
 
       highShelfB = oac.createBiquadFilter();
       highShelfB.type = 'highshelf';
@@ -421,8 +470,10 @@ class MixerEngine {
     const detuneRatioB = ratioFromSemitones(plan.pitchSemisB || 0);
     const baseRateA = 1 * detuneRatioA;
     const baseRateB = 1 * detuneRatioB;
-    const targetRateA = ((plan.targetTempoA || 120) / (buffers.metaA.tempo || 120)) * detuneRatioA;
-    const targetRateB = ((plan.targetTempoB || 120) / (buffers.metaB.tempo || 120)) * detuneRatioB;
+    const rawTargetRateA = ((plan.targetTempoA || 120) / (buffers.metaA.tempo || 120)) * detuneRatioA;
+    const rawTargetRateB = ((plan.targetTempoB || 120) / (buffers.metaB.tempo || 120)) * detuneRatioB;
+    const targetRateA = clampPlaybackRate(rawTargetRateA);
+    const targetRateB = clampPlaybackRate(rawTargetRateB);
 
     if (tempoRamp) {
       srcA.playbackRate.setValueAtTime(baseRateA, t0);
@@ -447,12 +498,20 @@ class MixerEngine {
       gainA.gain.linearRampToValueAtTime(clamp(gA, 0, 1), t);
       gainB.gain.linearRampToValueAtTime(clamp(gB, 0, 1), t);
       if (eqEnable) {
-        lowShelfA.gain.linearRampToValueAtTime(eqLowDuckDb * tt, t);
-        highShelfB.gain.linearRampToValueAtTime(eqHighBoostDb * tt, t);
+        const dA = easeOutCubic(tt);
+        const dB = easeInCubic(tt);
+        lowShelfA.gain.linearRampToValueAtTime((eqLowDuckDb || 0) * dA, t);
+        highShelfB.gain.linearRampToValueAtTime((eqHighBoostDb || 0) * dB, t);
+        if (lowShelfB) {
+          const duckB = (Math.min(0, eqLowDuckDb || 0)) * (1 - dB);
+          lowShelfB.gain.linearRampToValueAtTime(duckB, t);
+        }
       }
       if (filterSwap) {
-        const hpCut = 30 + tt * (220 - 30);
-        const lpCut = 4000 + tt * (20000 - 4000);
+        const dA = easeOutCubic(tt);
+        const dB = easeInCubic(tt);
+        const hpCut = 30 + dA * (220 - 30);
+        const lpCut = 4000 + dB * (20000 - 4000);
         hpA.frequency.linearRampToValueAtTime(hpCut, t);
         lpB.frequency.linearRampToValueAtTime(lpCut, t);
       }
