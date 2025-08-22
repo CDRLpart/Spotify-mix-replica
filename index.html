@@ -74,6 +74,26 @@
           </div>
         </div>
 
+        <fieldset style="grid-column: 1 / -1; border: 1px solid #2b2f36; padding: 8px; border-radius: 6px;">
+          <legend>Smart DJ</legend>
+          <div class="controls-grid" style="grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px;">
+            <label><input id="smartLength" type="checkbox" checked /> Smarte Länge</label>
+            <label><input id="phraseAlign" type="checkbox" checked /> Phrasen‑Ausrichtung</label>
+            <label><input id="harmonicMatch" type="checkbox" checked /> Harmonisch matchen</label>
+            <label><input id="tempoRamp" type="checkbox" checked /> Tempo‑Ramp</label>
+            <label><input id="filterSwap" type="checkbox" checked /> Filter‑Swap</label>
+            <label>Max. Detune (Halbtöne)
+              <input id="maxDetuneSemis" type="number" step="1" min="0" max="6" value="2" />
+            </label>
+            <label>Min Beats
+              <input id="minBeats" type="number" step="1" min="4" max="256" value="16" />
+            </label>
+            <label>Max Beats
+              <input id="maxBeats" type="number" step="1" min="8" max="512" value="64" />
+            </label>
+          </div>
+        </fieldset>
+
         <button id="autoPlan" class="primary">Auto-Übergang finden</button>
       </div>
 
