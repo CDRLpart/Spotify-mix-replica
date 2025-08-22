@@ -28,6 +28,18 @@ class AnalysisData {
     }
     return [0];
   }
+
+  /** Return approximate phrase starts (every 4 bars) */
+  getPhraseStarts() {
+    const bars = Array.isArray(this.raw?.bars) ? this.raw.bars : [];
+    if (bars.length === 0) return this.getDownbeats();
+    const phrase = 4; // 4 bars per phrase
+    const starts = [];
+    for (let i = 0; i < bars.length; i += phrase) {
+      starts.push(bars[i].start);
+    }
+    return starts;
+  }
 }
 
 /** Utility functions */
@@ -58,6 +70,48 @@ function chooseCurve(name) {
     case 'equal-power':
     default: return createEqualPowerGains;
   }
+}
+
+// Harmonic helpers
+function wrap12(n) { return ((n % 12) + 12) % 12; }
+function nearestSemitoneDelta(fromKey, toKey) {
+  if (!Number.isFinite(fromKey) || !Number.isFinite(toKey)) return 0;
+  let d = wrap12(fromKey - toKey); // 0..11
+  if (d > 6) d -= 12; // -6..+6
+  return d;
+}
+function ratioFromSemitones(semitones) { return Math.pow(2, (semitones || 0) / 12); }
+
+function averageSectionLoudness(analysis, start, end) {
+  if (!Array.isArray(analysis.sections) || analysis.sections.length === 0) return null;
+  const segs = analysis.sections.filter(s => (s.start + s.duration) > start && s.start < end);
+  if (segs.length === 0) return null;
+  const sum = segs.reduce((acc, s) => acc + (Number.isFinite(s.loudness) ? s.loudness : 0), 0);
+  return sum / segs.length; // negative values
+}
+
+function computeSmartBeatsLength(analysisA, analysisB, minBeats, maxBeats) {
+  const tempoA = analysisA.tempo || 120;
+  const tempoB = analysisB.tempo || 120;
+  const keyA = Number.isFinite(analysisA.key) ? analysisA.key : null;
+  const keyB = Number.isFinite(analysisB.key) ? analysisB.key : null;
+  const tempoDiff = Math.abs(tempoA - tempoB);
+  const keyDiff = (keyA != null && keyB != null) ? Math.abs(nearestSemitoneDelta(keyA, keyB)) : 0;
+
+  // Energy around intended regions: last 16s of A and first 16s of B
+  const endA = analysisA?.raw?.track?.duration || (analysisA.beats.at(-1)?.start || 180);
+  const loudA = averageSectionLoudness(analysisA, Math.max(0, endA - 16), endA) ?? -10;
+  const loudB = averageSectionLoudness(analysisB, 0, 16) ?? -10;
+  const energyFactor = ((-loudA) + (-loudB)) / 20; // louder => smaller negative, so lower factor
+
+  let beats = 16
+    + Math.round(tempoDiff / 6)   // up to ~10 beats for big tempo gaps
+    + Math.round(keyDiff / 2)     // up to ~3 beats for key gaps
+    + Math.round(energyFactor * 4); // up to ~4 beats if both are loud/complex
+
+  // Prefer multiples of 4 for phrase alignment
+  beats = Math.max(4, Math.round(beats / 4) * 4);
+  return clamp(beats, minBeats || 8, maxBeats || 128);
 }
 
 /**
@@ -99,7 +153,7 @@ function drawWaveform(canvas, audioBuffer) {
 /**
  * Transition planner: choose downbeat-aligned points and compute duration by beats
  */
-function planTransition(analysisA, analysisB, beatsLength, tempoStrategy) {
+function planTransition(analysisA, analysisB, beatsLength, tempoStrategy, opts = {}) {
   const downbeatsA = analysisA.getDownbeats();
   const downbeatsB = analysisB.getDownbeats();
 
@@ -118,15 +172,51 @@ function planTransition(analysisA, analysisB, beatsLength, tempoStrategy) {
     targetTempoB = avg;
   }
 
+  const minBeats = clamp(parseInt(opts.minBeats || 0, 10) || 0, 1, 512);
+  const maxBeats = clamp(parseInt(opts.maxBeats || 0, 10) || 0, minBeats || 1, 1024);
+  const chosenBeats = opts.smartLength
+    ? computeSmartBeatsLength(analysisA, analysisB, minBeats, maxBeats)
+    : clamp(isNaN(parseInt(beatsLength, 10)) ? 16 : beatsLength, minBeats || 1, maxBeats || 1024);
+
   const secondsPerBeatA = 60 / targetTempoA;
   const secondsPerBeatB = 60 / targetTempoB;
-  const xfadeDuration = beatsLength * Math.max(secondsPerBeatA, secondsPerBeatB);
+  // Use slower beat for time span to allow longer crossfade when one song is slower
+  let xfadeDuration = chosenBeats * Math.max(secondsPerBeatA, secondsPerBeatB);
 
-  // Choose near-outro downbeat in A and near-intro downbeat in B
+  // Prefer multiples of 4 beats if phrase alignment requested
+  if (opts.phraseAlign) {
+    const beatsPer4 = 4 * Math.max(secondsPerBeatA, secondsPerBeatB);
+    const phrases = Math.max(1, Math.round(xfadeDuration / beatsPer4));
+    xfadeDuration = phrases * beatsPer4;
+  }
+
+  // Choose near-outro downbeat in A and near-intro downbeat in B, respecting xfadeDuration and a safety margin
   const totalA = analysisA?.raw?.track?.duration || (analysisA.beats.at(-1)?.start || 180);
   const safeMargin = 5; // seconds
-  const startA = [...downbeatsA].reverse().find(t => t < (totalA - xfadeDuration - safeMargin)) ?? Math.max(0, totalA - xfadeDuration - safeMargin);
-  const startB = downbeatsB[0] ?? 0;
+
+  let startA = [...downbeatsA].reverse().find(t => t < (totalA - xfadeDuration - safeMargin)) ?? Math.max(0, totalA - xfadeDuration - safeMargin);
+  let startB = downbeatsB[0] ?? 0;
+
+  if (opts.phraseAlign) {
+    const phrasesA = analysisA.getPhraseStarts();
+    const phrasesB = analysisB.getPhraseStarts();
+    const targetEndA = totalA - safeMargin;
+    // pick phrase in A such that startA + xfade <= targetEndA
+    const candidateA = [...phrasesA].reverse().find(t => (t + xfadeDuration) <= targetEndA) ?? startA;
+    startA = candidateA;
+    // choose earliest phrase in B (avoid too early if there's awkward silence)
+    startB = phrasesB[0] ?? startB;
+  }
+
+  // Harmonic detune (small semitone nudges)
+  let pitchSemisA = 0;
+  let pitchSemisB = 0;
+  if (opts.harmonicMatch && Number.isFinite(analysisA.key) && Number.isFinite(analysisB.key)) {
+    const deltaToA = nearestSemitoneDelta(analysisA.key, analysisB.key); // how much to move B toward A
+    const maxDetune = clamp(parseInt(opts.maxDetuneSemis || 0, 10) || 0, 0, 6);
+    const applied = clamp(deltaToA, -maxDetune, maxDetune);
+    pitchSemisB = applied;
+  }
 
   return {
     startA,
@@ -134,6 +224,9 @@ function planTransition(analysisA, analysisB, beatsLength, tempoStrategy) {
     xfadeDuration,
     targetTempoA,
     targetTempoB,
+    chosenBeats,
+    pitchSemisA,
+    pitchSemisB,
   };
 }
 
@@ -157,7 +250,7 @@ class MixerEngine {
     if (!ctx) throw new Error('AudioContext fehlt');
 
     const { bufferA, bufferB } = buffers;
-    const { curve, eqEnable, eqLowDuckDb, eqHighBoostDb } = options;
+    const { curve, eqEnable, eqLowDuckDb, eqHighBoostDb, tempoRamp, filterSwap } = options;
 
     const g = ctx.createGain();
     g.connect(ctx.destination);
@@ -165,33 +258,45 @@ class MixerEngine {
     // Sources with playbackRate for tempo matching (naive time-stretch via resample)
     const srcA = ctx.createBufferSource();
     srcA.buffer = bufferA;
-    srcA.playbackRate.value = (plan.targetTempoA || 120) / (buffers.metaA.tempo || 120);
 
     const srcB = ctx.createBufferSource();
     srcB.buffer = bufferB;
-    srcB.playbackRate.value = (plan.targetTempoB || 120) / (buffers.metaB.tempo || 120);
 
     // Per-track gains
     const gainA = ctx.createGain();
     const gainB = ctx.createGain();
 
-    // Optional gentle EQ: duck lows of A, boost highs of B during xfade
+    // Optional EQ and filter swap
     let nodeA = srcA;
     let nodeB = srcB;
-    let lowShelfA, highShelfB;
+    let lowShelfA, highShelfB, hpA, lpB;
     if (eqEnable) {
       lowShelfA = ctx.createBiquadFilter();
       lowShelfA.type = 'lowshelf';
       lowShelfA.frequency.value = 150;
       lowShelfA.gain.value = 0; // automated later
+      nodeA.connect(lowShelfA);
+      nodeA = lowShelfA;
+
       highShelfB = ctx.createBiquadFilter();
       highShelfB.type = 'highshelf';
       highShelfB.frequency.value = 6000;
       highShelfB.gain.value = 0; // automated later
-      nodeA.connect(lowShelfA);
-      nodeA = lowShelfA;
       nodeB.connect(highShelfB);
       nodeB = highShelfB;
+    }
+    if (filterSwap) {
+      hpA = ctx.createBiquadFilter();
+      hpA.type = 'highpass';
+      hpA.frequency.value = 30;
+      nodeA.connect(hpA);
+      nodeA = hpA;
+
+      lpB = ctx.createBiquadFilter();
+      lpB.type = 'lowpass';
+      lpB.frequency.value = 4000;
+      nodeB.connect(lpB);
+      nodeB = lpB;
     }
 
     nodeA.connect(gainA).connect(g);
@@ -204,6 +309,24 @@ class MixerEngine {
 
     const t0 = now; // A starts
     const tX = t0 + xfade; // end of crossfade
+
+    // Tempo and pitch handling
+    const detuneRatioA = ratioFromSemitones(plan.pitchSemisA || 0);
+    const detuneRatioB = ratioFromSemitones(plan.pitchSemisB || 0);
+    const baseRateA = 1 * detuneRatioA;
+    const baseRateB = 1 * detuneRatioB;
+    const targetRateA = ((plan.targetTempoA || 120) / (buffers.metaA.tempo || 120)) * detuneRatioA;
+    const targetRateB = ((plan.targetTempoB || 120) / (buffers.metaB.tempo || 120)) * detuneRatioB;
+
+    if (tempoRamp) {
+      srcA.playbackRate.setValueAtTime(baseRateA, t0);
+      srcA.playbackRate.linearRampToValueAtTime(targetRateA, tX);
+      srcB.playbackRate.setValueAtTime(baseRateB, t0);
+      srcB.playbackRate.linearRampToValueAtTime(targetRateB, tX);
+    } else {
+      srcA.playbackRate.value = targetRateA;
+      srcB.playbackRate.value = targetRateB;
+    }
 
     srcA.start(t0, startAInBuffer);
     srcB.start(t0, startBInBuffer);
@@ -222,6 +345,13 @@ class MixerEngine {
         lowShelfA.gain.linearRampToValueAtTime(eqLowDuckDb * tt, t);
         highShelfB.gain.linearRampToValueAtTime(eqHighBoostDb * tt, t);
       }
+      if (filterSwap) {
+        // Thin out lows in A; open highs in B
+        const hpCut = 30 + tt * (220 - 30);
+        const lpCut = 4000 + tt * (20000 - 4000);
+        hpA.frequency.linearRampToValueAtTime(hpCut, t);
+        lpB.frequency.linearRampToValueAtTime(lpCut, t);
+      }
     }
 
     // After crossfade, fade out A quickly and keep B
@@ -237,35 +367,47 @@ class MixerEngine {
     const oac = new OfflineAudioContext({ numberOfChannels: 2, length: Math.ceil(renderDuration * sampleRate), sampleRate });
 
     const { bufferA, bufferB } = buffers;
-    const { curve, eqEnable, eqLowDuckDb, eqHighBoostDb } = options;
+    const { curve, eqEnable, eqLowDuckDb, eqHighBoostDb, tempoRamp, filterSwap } = options;
 
     const srcA = oac.createBufferSource();
     srcA.buffer = bufferA;
-    srcA.playbackRate.value = (plan.targetTempoA || 120) / (buffers.metaA.tempo || 120);
 
     const srcB = oac.createBufferSource();
     srcB.buffer = bufferB;
-    srcB.playbackRate.value = (plan.targetTempoB || 120) / (buffers.metaB.tempo || 120);
 
     const gainA = oac.createGain();
     const gainB = oac.createGain();
 
     let nodeA = srcA;
     let nodeB = srcB;
-    let lowShelfA, highShelfB;
+    let lowShelfA, highShelfB, hpA, lpB;
     if (eqEnable) {
       lowShelfA = oac.createBiquadFilter();
       lowShelfA.type = 'lowshelf';
       lowShelfA.frequency.value = 150;
       lowShelfA.gain.value = 0;
+      nodeA.connect(lowShelfA);
+      nodeA = lowShelfA;
+
       highShelfB = oac.createBiquadFilter();
       highShelfB.type = 'highshelf';
       highShelfB.frequency.value = 6000;
       highShelfB.gain.value = 0;
-      nodeA.connect(lowShelfA);
-      nodeA = lowShelfA;
       nodeB.connect(highShelfB);
       nodeB = highShelfB;
+    }
+    if (filterSwap) {
+      hpA = oac.createBiquadFilter();
+      hpA.type = 'highpass';
+      hpA.frequency.value = 30;
+      nodeA.connect(hpA);
+      nodeA = hpA;
+
+      lpB = oac.createBiquadFilter();
+      lpB.type = 'lowpass';
+      lpB.frequency.value = 4000;
+      nodeB.connect(lpB);
+      nodeB = lpB;
     }
 
     nodeA.connect(gainA).connect(oac.destination);
@@ -273,6 +415,24 @@ class MixerEngine {
 
     const t0 = 0.05;
     const xfade = plan.xfadeDuration;
+
+    // Tempo and pitch
+    const detuneRatioA = ratioFromSemitones(plan.pitchSemisA || 0);
+    const detuneRatioB = ratioFromSemitones(plan.pitchSemisB || 0);
+    const baseRateA = 1 * detuneRatioA;
+    const baseRateB = 1 * detuneRatioB;
+    const targetRateA = ((plan.targetTempoA || 120) / (buffers.metaA.tempo || 120)) * detuneRatioA;
+    const targetRateB = ((plan.targetTempoB || 120) / (buffers.metaB.tempo || 120)) * detuneRatioB;
+
+    if (tempoRamp) {
+      srcA.playbackRate.setValueAtTime(baseRateA, t0);
+      srcA.playbackRate.linearRampToValueAtTime(targetRateA, t0 + xfade);
+      srcB.playbackRate.setValueAtTime(baseRateB, t0);
+      srcB.playbackRate.linearRampToValueAtTime(targetRateB, t0 + xfade);
+    } else {
+      srcA.playbackRate.value = targetRateA;
+      srcB.playbackRate.value = targetRateB;
+    }
 
     srcA.start(t0, plan.startA);
     srcB.start(t0, plan.startB);
@@ -289,6 +449,12 @@ class MixerEngine {
       if (eqEnable) {
         lowShelfA.gain.linearRampToValueAtTime(eqLowDuckDb * tt, t);
         highShelfB.gain.linearRampToValueAtTime(eqHighBoostDb * tt, t);
+      }
+      if (filterSwap) {
+        const hpCut = 30 + tt * (220 - 30);
+        const lpCut = 4000 + tt * (20000 - 4000);
+        hpA.frequency.linearRampToValueAtTime(hpCut, t);
+        lpB.frequency.linearRampToValueAtTime(lpCut, t);
       }
     }
 
@@ -316,6 +482,15 @@ const els = {
   eqEnable: document.getElementById('eqEnable'),
   eqLowDuckDb: document.getElementById('eqLowDuckDb'),
   eqHighBoostDb: document.getElementById('eqHighBoostDb'),
+  // Smart DJ controls
+  smartLength: document.getElementById('smartLength'),
+  phraseAlign: document.getElementById('phraseAlign'),
+  harmonicMatch: document.getElementById('harmonicMatch'),
+  tempoRamp: document.getElementById('tempoRamp'),
+  filterSwap: document.getElementById('filterSwap'),
+  maxDetuneSemis: document.getElementById('maxDetuneSemis'),
+  minBeats: document.getElementById('minBeats'),
+  maxBeats: document.getElementById('maxBeats'),
   autoPlan: document.getElementById('autoPlan'),
   planInfo: document.getElementById('planInfo'),
   previewPlay: document.getElementById('previewPlay'),
@@ -432,6 +607,19 @@ function getBeatsLength() {
   return clamp(isNaN(val) ? 16 : val, 1, 128);
 }
 
+function getSmartOptions() {
+  return {
+    smartLength: !!els.smartLength?.checked,
+    phraseAlign: !!els.phraseAlign?.checked,
+    harmonicMatch: !!els.harmonicMatch?.checked,
+    tempoRamp: !!els.tempoRamp?.checked,
+    filterSwap: !!els.filterSwap?.checked,
+    maxDetuneSemis: Number(els.maxDetuneSemis?.value) || 0,
+    minBeats: Number(els.minBeats?.value) || undefined,
+    maxBeats: Number(els.maxBeats?.value) || undefined,
+  };
+}
+
 els.audioA.addEventListener('change', e => handleAudio('A', e.target.files?.[0] || null));
 els.audioB.addEventListener('change', e => handleAudio('B', e.target.files?.[0] || null));
 els.jsonA.addEventListener('change', e => handleJSON('A', e.target.files?.[0] || null));
@@ -440,9 +628,10 @@ els.jsonB.addEventListener('change', e => handleJSON('B', e.target.files?.[0] ||
 els.autoPlan.addEventListener('click', () => {
   if (!state.analysisA || !state.analysisB) return;
   const beats = getBeatsLength();
-  const plan = planTransition(state.analysisA, state.analysisB, beats, getTempoStrategy());
-  state.currentPlan = plan;
-  const text = `Start A: ${plan.startA.toFixed(2)}s • Start B: ${plan.startB.toFixed(2)}s • Dauer: ${plan.xfadeDuration.toFixed(2)}s • Zieltempi: A ${plan.targetTempoA.toFixed(1)}, B ${plan.targetTempoB.toFixed(1)}`;
+  const smart = getSmartOptions();
+  const plan = planTransition(state.analysisA, state.analysisB, beats, getTempoStrategy(), smart);
+  state.currentPlan = { ...plan, smart };
+  const text = `Start A: ${plan.startA.toFixed(2)}s • Start B: ${plan.startB.toFixed(2)}s • Dauer: ${plan.xfadeDuration.toFixed(2)}s • Beats: ${plan.chosenBeats} • Zieltempi: A ${plan.targetTempoA.toFixed(1)}, B ${plan.targetTempoB.toFixed(1)}${smart.harmonicMatch ? ` • Detune B: ${plan.pitchSemisB}st` : ''}${smart.phraseAlign ? ' • Phrase' : ''}`;
   els.planInfo.textContent = text;
 });
 
@@ -462,6 +651,8 @@ els.previewPlay.addEventListener('click', async () => {
       eqEnable: els.eqEnable.checked,
       eqLowDuckDb: Number(els.eqLowDuckDb.value) || 0,
       eqHighBoostDb: Number(els.eqHighBoostDb.value) || 0,
+      tempoRamp: !!state.currentPlan.smart?.tempoRamp,
+      filterSwap: !!state.currentPlan.smart?.filterSwap,
     }
   );
   state.previewNodes = nodes;
@@ -493,6 +684,8 @@ els.renderExport.addEventListener('click', async () => {
       eqEnable: els.eqEnable.checked,
       eqLowDuckDb: Number(els.eqLowDuckDb.value) || 0,
       eqHighBoostDb: Number(els.eqHighBoostDb.value) || 0,
+      tempoRamp: !!state.currentPlan.smart?.tempoRamp,
+      filterSwap: !!state.currentPlan.smart?.filterSwap,
     }
   );
   // Export WAV
